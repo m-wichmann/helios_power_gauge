@@ -1,6 +1,8 @@
 # Helios Power Gauge
 The Helios Power Gauge is a simple display of power data for the house, PV, battery and EV wallbox. The project is rather specific to this setup and is not meant to be generalised, but maybe someone still finds something useful.
 
+![Helios Power Gauge](/images/helios_demo.jpg)
+
 
 ## Software
 Helios was setup on Raspberry Pi OS by copying the necessary files and setting up a systemd unit. Following steps need to be done:

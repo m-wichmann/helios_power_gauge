@@ -1,0 +1,14 @@
+[Unit]
+Description=Helios service
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=60
+User=helios
+ExecStart=/home/helios/helios.py
+WorkingDirectory=/home/helios/
+
+[Install]
+WantedBy=multi-user.target

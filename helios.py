@@ -273,7 +273,7 @@ class Designer:
         self.draw = ImageDraw.Draw(self.image_buffer)
 
         self._draw_battery(data.battery_charge_level)
-        self._draw_house(data.power_use - data.active_power)
+        self._draw_house(data.power_use) # includes data.active_poper from charging station
 
         # set car name to be displayed depending on RFID data
         car_name = WALLBOX_RFID_CARDS.get(data.rfid_card, '')
@@ -484,7 +484,7 @@ def format_measurement(value, unit):
         return f'{value:.0f} {unit}'
     else:
         try:
-            magnitude = int(math.floor(math.log10(float(value))))
+            magnitude = int(math.floor(math.log10(abs(float(value)))))
             match magnitude:
                 case 0: return f'{value:.0f} {unit}'
                 case 1: return f'{value:.0f} {unit}'

@@ -281,12 +281,14 @@ class Designer:
         self._draw_car(car_name)
 
         # switch arrow direction to battery depending on charging status
-        if data.battery_charge_status == 'Discharging':
+        if data.battery_charge_status == 4:
+            # discharging
             self._draw_arrow((35, 64), (90, 64))
-        elif data.battery_charge_status == 'Charging':
+        elif data.battery_charge_status == 3:
+            # charging
             self._draw_arrow((90, 64), (35, 64))
-        elif data.battery_charge_status == 'Idle':
-            # do not draw arrow if battery is neither charging nor discharging
+        elif data.battery_charge_status == 7:
+            # idle, do not draw arrow if battery is neither charging nor discharging
             pass
 
         # draw arrow from PV only when energy is supplied
@@ -329,7 +331,7 @@ class ModbusConnection:
 
     async def __aenter__(self):
         self.client = tmodbus.create_async_tcp_client(
-            host=self.host, 
+            host=self.host,
             port=self.port,
             unit_id=self.unit_id,
             timeout=10.0,
@@ -407,11 +409,12 @@ async def read_data_from_converter_via_modbus():
         solaredge = await SolarEdge.async_probe(unit)  # detects the layout
         await solaredge.async_update()  # one read per sub-system
         inverter = solaredge.inverter
-        print(f"{solaredge.common.manufacturer} {solaredge.common.model} {inverter.status.name if inverter.status else 'unknown'}")
+        if VERBOSE:
+            print(f"{solaredge.common.manufacturer} {solaredge.common.model} {inverter.status.name if inverter.status else 'unknown'}")
         meter = solaredge.meters[0] if solaredge.meters else None
         battery = solaredge.batteries[0]
         battery_charge_level = battery.state_of_energy if battery.state_of_energy is not None else 0
-        battery_charge_status = battery.status.name if battery.status else 'unknown'
+        battery_charge_status = battery.status if battery.status else 0
         battery_charge_power = battery.dc_power if battery.dc_power is not None else 0
         power_from_pv = inverter.ac_power if inverter.ac_power is not None else 0
         power_from_grid = -meter.ac_power if meter.ac_power < 0 else 0
@@ -420,27 +423,27 @@ async def read_data_from_converter_via_modbus():
         power_self_consumption = power_use - power_from_grid - battery_charge_power
     finally:
         await connection.close()
-    
+
     return battery_charge_level, battery_charge_status, battery_charge_power, power_use, power_from_grid, power_from_pv, power_self_consumption, power_feed_in
 
 
 def read_power_flow_data_from_api(access_token, site_id):
     """
     Reads all power flow values from the SolarEdge API.
-    
+
     This endpoint is part of the Advanced Monitoring API (Business Pro and Enterprise only).
     """
     url = f'https://monitoringapi.solaredge.com/v2/sites/{site_id}/power-flow'
     response = requests.get(url, headers={'Authorization': f'Bearer {access_token}'}, timeout=5)
-    if response.status_code == 200:    
+    if response.status_code == 200:
         data = response.json()
         scaling_factor = 1000 if data['unit'] == 'kW' else 1
         battery_charge_level = data['storage']['chargeLevel']
-        battery_charge_status = data['storage']['status']
+        battery_charge_status = data['storage']['status'] # allowed values: CHARGE, DISCHARGE, IDLE
         battery_charge_power = float(data['storage']['power']) * scaling_factor
         return battery_charge_level, battery_charge_status, battery_charge_power
     elif response.status_code == 403:
-        return 0, 'Unknown', 0  # API access not available for this account
+        return 0, 'UNKNOWN', 0  # API access not available for this account
     else:
         print(f'Error: {response}')
         raise HeliosException('Error reading data from SolarEdge API: ', response.status_code, response.text)
@@ -489,7 +492,7 @@ def read_power_details_data_from_api(access_token, site_id):
     try:
         # new version of API provides only power values for import, export and consumption
         import_power_15m = float(extract_value_with_scaling(data, 'importPower'))
-        export_power_15m = float(extract_value_with_scaling(data, 'exportPower'))     
+        export_power_15m = float(extract_value_with_scaling(data, 'exportPower'))
         consumption_power_15m = float(extract_value_with_scaling(data, 'consumptionPower'))
 
         power_feed_in_15m = export_power_15m
@@ -579,9 +582,23 @@ class MeasuringData:
             5: 'The charging process is temporarily interrupted because the temperature is too high or the wallbox is in suspended mode.',
         }
 
+        # battery charge status values
+        # source: https://github.com/frenck/python-solaredged/blob/dc6c0241d34ad93f118f3a443a26483fd283131a/src/solaredged/const.py#L107
+        battery_charge_status_values = {
+            0: 'Off',
+            1: 'Standby',
+            2: 'Init',
+            3: 'Charge',
+            4: 'Discharge',
+            5: 'Fault',
+            6: 'Preserve Charge',
+            7: 'Idle',
+            10: 'Power Saving'
+        }
+
         ret = ''
         ret += f'Battery charge level: {self.battery_charge_level} %\n'
-        ret += f'Battery charge status: {self.battery_charge_status}\n'
+        ret += f'Battery charge status: {battery_charge_status_values[self.battery_charge_status]}\n'
         ret += f'Battery charge power: {self.battery_charge_power} W\n'
         ret += f'Power use including EV charging station: {self.power_use} W\n'
         ret += f'Power from grid: {self.power_from_grid} W\n'

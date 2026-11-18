@@ -7,10 +7,12 @@ The Helios Power Gauge is a simple display of power data for the house, PV, batt
 ## Software
 
 Helios was setup on Raspberry Pi OS by copying the necessary files and setting up a systemd unit. Following steps need to be done:
-* Install Raspberry Pi OS (tested with Debian 12 Bookworm)
+
+* Install Raspberry Pi OS (tested with Debian 13 Trixie)
 * Activate SPI via `raspi-config`
 * Setup all available WiFis: `nmtui`
-* Install all requirements: `sudo apt install python3-spidev python3-pil python3-requests`
+* Install all requirements from repo: `sudo apt install python3-spidev python3-pil python3-requests`
+* Install missing requirements directly from pypi: `sudo pip install -r requirements.txt --break-system-packages`
 * Copy "helios.py", "arial.ttf" and "car.png" to /home/helios/
 * Make script executable: `chmod a+x /home/helios/helios.py`
 * Customize API keys, IPs... at the top of helios.py

@@ -1,0 +1,4 @@
+#spidev==3.6
+#Pillow==11.1.0
+#requests==2.32.3
+solaredged[tmodbus]==0.5.0

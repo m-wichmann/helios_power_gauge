@@ -5,13 +5,14 @@ import time
 import math
 import datetime
 import urllib.parse
+import asyncio
 
 import spidev
 import gpiozero
 from PIL import Image, ImageDraw, ImageFont
 
 import requests
-from pymodbus.client import ModbusTcpClient
+import tmodbus
 from pymodbus.payload import BinaryPayloadDecoder
 from pymodbus.constants import Endian
 
@@ -316,23 +317,29 @@ class Designer:
 
 class ModbusConnection:
     """
-    Context manager for Modbus connection
+    Async context manager for Modbus TCP connection using tmodbus 1.1.0
 
-    Stolen from: https://gist.github.com/wcheek/35599f2db14592129c358f3b35988d16
+    tmodbus 1.1.0 is async-only and requires await.
     """
-    def __init__(self, host, port):
+    def __init__(self, host, port, unit_id=1):
         self.host = host
         self.port = port
+        self.unit_id = unit_id
         self.client = None
 
-    def __enter__(self):
-        self.client = ModbusTcpClient(host=self.host, port=self.port)
-        self.client.connect()
+    async def __aenter__(self):
+        self.client = tmodbus.create_async_tcp_client(
+            host=self.host, 
+            port=self.port,
+            unit_id=self.unit_id,
+            timeout=10.0,
+            auto_reconnect=True
+        )
         return self.client
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.client:
-            self.client.close()
+            await self.client.disconnect()
         return False
 
 
@@ -340,32 +347,48 @@ class HeliosException(Exception):
     """Custom exception for Helios Power Gauge."""
 
 
-def read_data_from_charging_station_via_modbus():
+def convert_registers_to_uint32(registers):
+    """Convert two 16-bit registers to a 32-bit unsigned integer."""
+    if len(registers) < 2:
+        raise HeliosException('Unexpected Modbus register value: insufficient registers')
+    return (registers[0] << 16) | registers[1]
+
+
+def convert_registers_to_int32(registers):
+    """Convert two 16-bit registers to a 32-bit signed integer."""
+    if len(registers) < 2:
+        raise HeliosException('Unexpected Modbus register value: insufficient registers')
+    value = (registers[0] << 16) | registers[1]
+    if value >= 0x80000000:
+        value -= 0x100000000
+    return value
+
+
+async def read_data_from_charging_station_via_modbus():
     """
     Read all necessary data points from the wallbox by ModbusTCP.
 
     References:
      - Modbus addresses for wallbox:
-       https://www.keba.com/download/x/dea7ae6b84/kecontactp30modbustcp_pgen.pdf
+       https://a.storyblok.com/f/40131/x/44932c2bc8/kecontactp30modbustcp_pgen.pdf
     """
-    with ModbusConnection(host=WALLBOX_IP, port=WALLBOX_PORT) as client:
+    async with ModbusConnection(host=WALLBOX_IP, port=WALLBOX_PORT) as client:
         # read charging status
-        result = client.read_holding_registers(address=1000, count=1)
-        charging_status = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint()
+        result = await client.read_holding_registers(1000, 2)
+        charging_status = convert_registers_to_uint32(result)
         # read total energy (register contains the total energy consumption in 0.1 watt-hours)
-        result = client.read_holding_registers(address=1036, count=1)
-        total_energy = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint() / 10000
+        result = await client.read_holding_registers(1036, 2)
+        total_energy = convert_registers_to_uint32(result) / 10000
         # read active power (register contains the active power in milliwatts)
-        result = client.read_holding_registers(address=1020, count=1)
-        active_power = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint() / 1000
+        result = await client.read_holding_registers(1020, 2)
+        active_power = convert_registers_to_uint32(result) / 1000
         # read RFID card number
-        result = client.read_holding_registers(address=1500, count=1)
-        rfid_card = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint()
+        result = await client.read_holding_registers(1500, 2)
+        rfid_card = convert_registers_to_uint32(result)
         # read charged energy (register contains the transferred energy of the current session in 0.1 watt-hours)
-        #result = client.read_holding_registers(address=1502, count=1)
-        #charged_energy = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.BIG).decode_32bit_uint() / 10000
-        #print(f'Charged energy in current session: {charged_energy} kWh')
-    return charging_status, total_energy, active_power, rfid_card
+        result = await client.read_holding_registers(1502, 2)
+        charged_energy_for_session = convert_registers_to_uint32(result) / 10000
+    return charging_status, total_energy, active_power, rfid_card, charged_energy_for_session
 
 
 def read_data_from_converter_via_modbus():
@@ -515,12 +538,29 @@ def format_measurement(value, unit):
 
 
 class MeasuringData:
-    def __init__(self, prefer_modbus=False):
-        if prefer_modbus:
-            self.battery_charge_level, self.battery_charge_status, self.battery_charge_power, self.power_use, self.power_from_grid, self.power_from_pv, self.power_self_consumption, self.power_feed_in = read_data_from_converter_via_modbus()
+    def __init__(self, prefer_modbus=True):
+        self.prefer_modbus = prefer_modbus
+        self.battery_charge_level = 0
+        self.battery_charge_status = 'Unknown'
+        self.battery_charge_power = 0
+        self.power_use = 0
+        self.power_from_grid = 0
+        self.power_from_pv = 0
+        self.power_self_consumption = 0
+        self.power_feed_in = 0
+        self.charging_status = 0
+        self.total_energy = 0
+        self.active_power = 0
+        self.rfid_card = 0
+        self.charged_energy_for_session = 0
+
+    async def load_data(self):
+        """Asynchronously load data from Modbus and/or API."""
+        if self.prefer_modbus:
+            self.battery_charge_level, self.battery_charge_status, self.battery_charge_power, self.power_use, self.power_from_grid, self.power_from_pv, self.power_self_consumption, self.power_feed_in = await read_data_from_converter_via_modbus()
         else:
             self.battery_charge_level, self.battery_charge_status, self.battery_charge_power, self.power_use, self.power_from_grid, self.power_from_pv, self.power_self_consumption, self.power_feed_in = read_data_from_converter_via_api()
-        self.charging_status, self.total_energy, self.active_power, self.rfid_card = read_data_from_charging_station_via_modbus()
+        self.charging_status, self.total_energy, self.active_power, self.rfid_card, self.charged_energy_for_session = await read_data_from_charging_station_via_modbus()
 
     def __str__(self):
         charging_status_values = {
@@ -545,6 +585,7 @@ class MeasuringData:
         ret += f'Total energy: {self.total_energy} kWh\n'
         ret += f'Active power: {self.active_power} W\n'
         ret += f'RFID card: {self.rfid_card:0x}\n'
+        ret += f'Charged energy for current session: {self.charged_energy_for_session} kWh\n'
         return ret
 
 

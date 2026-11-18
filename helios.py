@@ -13,8 +13,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 import requests
 import tmodbus
-from pymodbus.payload import BinaryPayloadDecoder
-from pymodbus.constants import Endian
+from solaredged import SolarEdge
+from modbus_connection.tmodbus import connect_tcp
 
 
 VERBOSE = False
@@ -391,29 +391,36 @@ async def read_data_from_charging_station_via_modbus():
     return charging_status, total_energy, active_power, rfid_card, charged_energy_for_session
 
 
-def read_data_from_converter_via_modbus():
+async def read_data_from_converter_via_modbus():
     """
     Read all necessary data points from the converter by ModbusTCP.
 
     References:
      - Modbus addresses for inverter:
        https://knowledge-center.solaredge.com/sites/kc/files/sunspec-implementation-technical-note.pdf
-     - Decoding of values with BinaryPayloadDecoder:
-       https://pymodbus.readthedocs.io/en/latest/source/library/pymodbus.html#pymodbus.payload.BinaryPayloadDecoder
+     - tmodbus 1.1.0 async API:
+       https://github.com/timohagebacker/tmodbus
     """
-    with ModbusConnection(host=CONVERTER_IP, port=CONVERTER_PORT) as client:
-        # read current AC power from converter
-        result = client.read_holding_registers(address=40083, count=2)
-        ac_power_used_value = BinaryPayloadDecoder.fromRegisters([result.registers[0]], byteorder=Endian.Big).decode_16bit_int()
-        ac_power_used_scale_factor = BinaryPayloadDecoder.fromRegisters([result.registers[1]], byteorder=Endian.Big).decode_16bit_int()
-        power_use = ac_power_used_value * pow(10, ac_power_used_scale_factor)
-    battery_charge_level = 0
-    battery_charge_status = 'Unknown'
-    battery_charge_power = 0
-    power_from_grid = 0
-    power_from_pv = 0
-    power_self_consumption = 0
-    power_feed_in = 0
+    connection = await connect_tcp("192.168.10.54", port=502)
+    try:
+        unit = connection.for_unit(1)
+        solaredge = await SolarEdge.async_probe(unit)  # detects the layout
+        await solaredge.async_update()  # one read per sub-system
+        inverter = solaredge.inverter
+        print(f"{solaredge.common.manufacturer} {solaredge.common.model} {inverter.status.name if inverter.status else 'unknown'}")
+        meter = solaredge.meters[0] if solaredge.meters else None
+        battery = solaredge.batteries[0]
+        battery_charge_level = battery.state_of_energy if battery.state_of_energy is not None else 0
+        battery_charge_status = battery.status.name if battery.status else 'unknown'
+        battery_charge_power = battery.dc_power if battery.dc_power is not None else 0
+        power_from_pv = inverter.ac_power if inverter.ac_power is not None else 0
+        power_from_grid = -meter.ac_power if meter.ac_power < 0 else 0
+        power_use = power_from_pv + battery_charge_power + power_from_grid
+        power_feed_in = meter.ac_power if meter.ac_power > 0 else 0
+        power_self_consumption = power_use - power_from_grid - battery_charge_power
+    finally:
+        await connection.close()
+    
     return battery_charge_level, battery_charge_status, battery_charge_power, power_use, power_from_grid, power_from_pv, power_self_consumption, power_feed_in
 
 
@@ -590,8 +597,13 @@ class MeasuringData:
 
 
 if __name__ == '__main__':
-    with Display() as display:
-        designer = Designer(display)
-        while True:
-            designer.draw_data(MeasuringData())
-            time.sleep(DISPLAY_REFRESH_TIME)
+    async def main():
+        data = MeasuringData(prefer_modbus=False)
+        with Display() as display:
+            designer = Designer(display)
+            while True:
+                await data.load_data()
+                designer.draw_data(data)
+                await asyncio.sleep(DISPLAY_REFRESH_TIME)
+
+    asyncio.run(main())

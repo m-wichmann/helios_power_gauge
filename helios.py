@@ -20,7 +20,7 @@ VERBOSE = False
 DISPLAY_REFRESH_TIME = 10 * 60
 
 # TODO: Add API key and site id
-SOLAREDGE_API_KEY = ''
+SOLAREDGE_ACCESS_TOKEN = ''
 SOLAREDGE_SITE_ID = ''
 
 # TODO: Add IP and port
@@ -394,64 +394,81 @@ def read_data_from_converter_via_modbus():
     return battery_charge_level, battery_charge_status, battery_charge_power, power_use, power_from_grid, power_from_pv, power_self_consumption, power_feed_in
 
 
-def read_power_flow_data_from_api(api_key, site_id):
-    """Reads all power flow values from the SolarEdge API."""
-    url = f'https://monitoringapi.solaredge.com/site/{site_id}/currentPowerFlow?api_key={api_key}'
-    response = requests.get(url, timeout=5)
-    if response.status_code != 200:
+def read_power_flow_data_from_api(access_token, site_id):
+    """
+    Reads all power flow values from the SolarEdge API.
+    
+    This endpoint is part of the Advanced Monitoring API (Business Pro and Enterprise only).
+    """
+    url = f'https://monitoringapi.solaredge.com/v2/sites/{site_id}/power-flow'
+    response = requests.get(url, headers={'Authorization': f'Bearer {access_token}'}, timeout=5)
+    if response.status_code == 200:    
+        data = response.json()
+        scaling_factor = 1000 if data['unit'] == 'kW' else 1
+        battery_charge_level = data['storage']['chargeLevel']
+        battery_charge_status = data['storage']['status']
+        battery_charge_power = float(data['storage']['power']) * scaling_factor
+        return battery_charge_level, battery_charge_status, battery_charge_power
+    elif response.status_code == 403:
+        return 0, 'Unknown', 0  # API access not available for this account
+    else:
         print(f'Error: {response}')
-        raise HeliosException('Error reading data from SolarEdge API')
-    data = response.json()['siteCurrentPowerFlow']
-    scaling_factor = 1000 if data['unit'] == 'kW' else 1
-    battery_charge_level = data['STORAGE']['chargeLevel']
-    battery_charge_status = data['STORAGE']['status']
-    battery_charge_power = float(data['STORAGE']['currentPower']) * scaling_factor
-    return battery_charge_level, battery_charge_status, battery_charge_power
+        raise HeliosException('Error reading data from SolarEdge API: ', response.status_code, response.text)
 
 
-def read_power_details_data_from_api(api_key, site_id):
+def extract_value_with_scaling(data, key):
+    """
+    Extracts the value for a given key from the SolarEdge API response data and applies scaling based on the unit.
+
+    Data structure: data['meters']['606693985']['importEnergy']['values'][0]['value']
+    """
+    for meter in data['meters']:
+        meter_date = data['meters'][meter]
+        if key in meter_date:
+            value = meter_date[key]['values'][0]['value']
+            unit = meter_date[key]['unit']
+            scaling_factor = 1000 if unit == 'kW' else 1
+            return value * scaling_factor
+    return None
+
+
+def read_power_details_data_from_api(access_token, site_id):
     """
     Reads all power values as median over the last 15 minutes from the
     SolarEdge API.
     """
     # build URL for API request
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(datetime.timezone.utc)
     fifteen_minutes_ago = now - datetime.timedelta(minutes=15)
-    start_time = fifteen_minutes_ago.strftime('%Y-%m-%d %H:%M:%S')
-    end_time = now.strftime('%Y-%m-%d %H:%M:%S')
+    start_time = fifteen_minutes_ago.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time = now.strftime('%Y-%m-%dT%H:%M:%SZ')
     start_time_url = urllib.parse.quote(start_time, safe='/', encoding=None, errors=None)
     end_time_url = urllib.parse.quote(end_time, safe='/', encoding=None, errors=None)
-    url = f'https://monitoringapi.solaredge.com/site/{site_id}/powerDetails?startTime={start_time_url}&endTime={end_time_url}&api_key={api_key}'
-    response = requests.get(url, timeout=5)
+    url = f'https://monitoringapi.solaredge.com/v2/sites/{site_id}/meters/telemetry?resolution=QUARTER_HOUR&from={start_time_url}&to={end_time_url}'
+    response = requests.get(url, headers={'Authorization': f'Bearer {access_token}'}, timeout=5)
     if response.status_code != 200:
         print(f'Error: {response}')
-        raise HeliosException('Error reading data from SolarEdge API')
+        raise HeliosException('Error reading data from SolarEdge API', response.status_code, response.text)
     # extract power values from response
     data = response.json()
-    scaling_factor = 1000 if data['powerDetails']['unit'] == 'kW' else 1
     power_production_15m = 0
     power_consumption_15m = 0
     power_purchased_15m = 0
     power_self_consumption_15m = 0
     power_feed_in_15m = 0
-    for meter in data['powerDetails']['meters']:
-        try:
-            # check if last measurement contains no actual value...
-            if 'value' not in meter['values'][-1]:
-                # ...and delete last element if that's true
-                del meter['values'][-1]
-            if meter['type'] == 'Production':
-                power_production_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'Consumption':
-                power_consumption_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'SelfConsumption':
-                power_self_consumption_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'FeedIn':
-                power_feed_in_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'Purchased':
-                power_purchased_15m = float(meter['values'][-1]['value']) * scaling_factor
-        except KeyError:
-            pass
+    try:
+        # new version of API provides only power values for import, export and consumption
+        import_power_15m = float(extract_value_with_scaling(data, 'importPower'))
+        export_power_15m = float(extract_value_with_scaling(data, 'exportPower'))     
+        consumption_power_15m = float(extract_value_with_scaling(data, 'consumptionPower'))
+
+        power_feed_in_15m = export_power_15m
+        power_production_15m = export_power_15m + consumption_power_15m - import_power_15m
+        power_consumption_15m = consumption_power_15m
+        power_self_consumption_15m = consumption_power_15m - export_power_15m
+        power_purchased_15m = import_power_15m - export_power_15m
+    except KeyError:
+        pass
     return power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m
 
 
@@ -466,8 +483,8 @@ def read_data_from_converter_via_api():
        https://www.solaredge.com/sites/default/files/se_monitoring_api.pdf
        https://developers.solaredge.com/docs/monitoring/e9nwvc91l1jf5-getting-started-with-monitoring-api
     """
-    battery_charge_level, battery_charge_status, battery_charge_power = read_power_flow_data_from_api(SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID)
-    power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m = read_power_details_data_from_api(SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID)
+    battery_charge_level, battery_charge_status, battery_charge_power = read_power_flow_data_from_api(SOLAREDGE_ACCESS_TOKEN, SOLAREDGE_SITE_ID)
+    power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m = read_power_details_data_from_api(SOLAREDGE_ACCESS_TOKEN, SOLAREDGE_SITE_ID)
     return battery_charge_level, battery_charge_status, battery_charge_power, power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m
 
 

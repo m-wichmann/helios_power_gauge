@@ -289,8 +289,10 @@ class Designer:
             pass
 
         # draw arrow from PV only when energy is supplied
-        if data.power_from_pv:
+        if data.power_from_pv > 0:
             self._draw_arrow((self.display.WIDTH/2, 4), (self.display.WIDTH/2, 35))
+        else:
+            self._draw_arrow((self.display.WIDTH/2, 35), (self.display.WIDTH/2, 4))
 
         # draw arrow to charging station only when car is charging
         if data.charger_charging_status == 3:
@@ -302,7 +304,7 @@ class Designer:
         else:
             self._draw_arrow((self.display.WIDTH/2, 95), (self.display.WIDTH/2, 124))
 
-        self._draw_labels(data.battery_charge_power, data.power_from_pv, abs(data.power_from_grid), data.charger_active_power)
+        self._draw_labels(data.battery_charge_power, abs(data.power_from_pv), abs(data.power_from_grid), data.charger_active_power)
 
         self._draw_timestamp()
 
@@ -419,7 +421,7 @@ async def read_data_from_converter_via_modbus():
     finally:
         await connection.close()
 
-    return battery_charge_level, battery_charge_status, battery_charge_power, power_from_grid, power_from_pv
+    return battery_charge_level, battery_charge_status, battery_charge_power, power_from_grid, power_from_pv+battery_charge_power
 
 
 def format_measurement(value, unit):

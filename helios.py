@@ -10,9 +10,8 @@ import spidev
 import gpiozero
 from PIL import Image, ImageDraw, ImageFont
 
-import tmodbus
 from solaredged import SolarEdge
-from modbus_connection.tmodbus import connect_tcp
+from tmodbus import create_async_tcp_client
 
 
 VERBOSE = False
@@ -314,34 +313,6 @@ class Designer:
         self.display.display(self.image_buffer, None)
 
 
-class ModbusConnection:
-    """
-    Async context manager for Modbus TCP connection using tmodbus 1.1.0
-
-    tmodbus 1.1.0 is async-only and requires await.
-    """
-    def __init__(self, host, port, unit_id=1):
-        self.host = host
-        self.port = port
-        self.unit_id = unit_id
-        self.client = None
-
-    async def __aenter__(self):
-        self.client = tmodbus.create_async_tcp_client(
-            host=self.host,
-            port=self.port,
-            unit_id=self.unit_id,
-            timeout=10.0,
-            auto_reconnect=True
-        )
-        return self.client
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.client:
-            await self.client.disconnect()
-        return False
-
-
 class HeliosException(Exception):
     """Custom exception for Helios Power Gauge."""
 
@@ -371,7 +342,7 @@ async def read_data_from_charging_station_via_modbus():
      - Modbus addresses for wallbox:
        https://a.storyblok.com/f/40131/x/44932c2bc8/kecontactp30modbustcp_pgen.pdf
     """
-    async with ModbusConnection(host=WALLBOX_IP, port=WALLBOX_PORT) as client:
+    async with create_async_tcp_client(WALLBOX_IP, WALLBOX_PORT, unit_id=1) as client:
         # read charging status
         result = await client.read_holding_registers(1000, 2)
         charging_status = convert_registers_to_uint32(result)
@@ -397,30 +368,23 @@ async def read_data_from_converter_via_modbus():
     References:
      - Modbus addresses for inverter:
        https://knowledge-center.solaredge.com/sites/kc/files/sunspec-implementation-technical-note.pdf
-     - tmodbus 1.1.0 async API:
-       https://github.com/timohagebacker/tmodbus
+     - tmodbus:
+       https://github.com/wlcrs/tmodbus
     """
-    connection = await connect_tcp("192.168.10.54", port=502)
-    try:
-        unit = connection.for_unit(1)
-        solaredge = await SolarEdge.async_probe(unit)  # detects the layout
+    async with create_async_tcp_client(CONVERTER_IP, CONVERTER_PORT, unit_id=1) as client:
+        # detect the layout of the inverter
+        solaredge = await SolarEdge.async_probe(client)
         await solaredge.async_update()  # one read per sub-system
-
         inverter = solaredge.inverter
         power_from_pv = inverter.ac_power
         if VERBOSE:
             print(f"{solaredge.common.manufacturer} {solaredge.common.model}: {inverter.status.name}")
-
         battery = solaredge.batteries[0]
         battery_charge_level = battery.state_of_energy if battery.state_of_energy is not None else 0
         battery_charge_status = battery.status if battery.status else 0
         battery_charge_power = battery.dc_power if battery.dc_power is not None else 0
-
         meter = solaredge.meters[0]
         power_from_grid = -meter.ac_power
-    finally:
-        await connection.close()
-
     return battery_charge_level, battery_charge_status, battery_charge_power, power_from_grid, power_from_pv+battery_charge_power
 
 

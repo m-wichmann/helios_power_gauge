@@ -4,14 +4,12 @@ import os
 import time
 import math
 import datetime
-import urllib.parse
 import asyncio
 
 import spidev
 import gpiozero
 from PIL import Image, ImageDraw, ImageFont
 
-import requests
 import tmodbus
 from solaredged import SolarEdge
 from modbus_connection.tmodbus import connect_tcp
@@ -144,13 +142,13 @@ class Display:
         self._send_command(Display.EPD_CMD_POWER_ON)
         self._read_busy()
 
-        if blackimage != None:
+        if blackimage is not None:
             if isinstance(blackimage, Image.Image):
                 blackimage = self._getbuffer(blackimage)
             self._send_command(Display.EPD_CMD_DISPLAY_START_BW)
             self._send_data2(blackimage)
 
-        if ryimage != None:
+        if ryimage is not None:
             if isinstance(ryimage, Image.Image):
                 ryimage = self._getbuffer(ryimage)
             self._send_command(Display.EPD_CMD_DISPLAY_START_R)
@@ -190,6 +188,8 @@ class Designer:
         self.display = display
         self.font = ImageFont.truetype(os.path.join(Designer.RESSOURCE_DIR, Designer.FONT_PATH), 18)
         self.font_small = ImageFont.truetype(os.path.join(Designer.RESSOURCE_DIR, Designer.FONT_PATH), 11)
+        self.image_buffer = None
+        self.draw = None
 
     def _draw_battery(self, state):
         self.draw.rectangle((1+5, 15, 29-5, 20), fill=1, outline=0)
@@ -254,7 +254,8 @@ class Designer:
             self.draw.line(((coord0[0], coord0[1]), (coord1[0], coord1[1])), fill=0, width=3)
 
     def _draw_timestamp(self):
-        self.draw.text((296, 128), f'{datetime.datetime.now().strftime("%d.%m.%y %H:%M")}', font=self.font_small, anchor='rb', fill=0)
+        current_time = datetime.datetime.now().strftime("%d.%m.%y %H:%M")
+        self.draw.text((296, 128), f'{current_time}', font=self.font_small, anchor='rb', fill=0)
 
     def _draw_labels(self, p_bat, p_pv, p_grid, p_car):
         if p_bat: self.draw.text((40, 75), f'{format_measurement(p_bat, "W")}', font=self.font, fill=0)
@@ -402,17 +403,17 @@ async def read_data_from_converter_via_modbus():
         unit = connection.for_unit(1)
         solaredge = await SolarEdge.async_probe(unit)  # detects the layout
         await solaredge.async_update()  # one read per sub-system
-        
+
         inverter = solaredge.inverter
         power_from_pv = inverter.ac_power
         if VERBOSE:
-            print(f"{solaredge.common.manufacturer} {solaredge.common.model}: {inverter.status.name if inverter.status else 'unknown'}")
-        
+            print(f"{solaredge.common.manufacturer} {solaredge.common.model}: {inverter.status.name}")
+
         battery = solaredge.batteries[0]
         battery_charge_level = battery.state_of_energy if battery.state_of_energy is not None else 0
         battery_charge_status = battery.status if battery.status else 0
-        battery_charge_power = -battery.dc_power if battery.dc_power is not None else 0
-        
+        battery_charge_power = battery.dc_power if battery.dc_power is not None else 0
+
         meter = solaredge.meters[0]
         power_from_grid = -meter.ac_power
     finally:
@@ -428,23 +429,22 @@ def format_measurement(value, unit):
     """
     if not value:
         return f'0 {unit}'
-    elif unit == 'kWh':
+    if unit == 'kWh':
         return f'{value:.0f} {unit}'
-    elif unit == '%':
+    if unit == '%':
         return f'{value:.0f} {unit}'
-    else:
-        try:
-            magnitude = int(math.floor(math.log10(abs(float(value)))))
-            match magnitude:
-                case 0: return f'{value:.0f} {unit}'
-                case 1: return f'{value:.0f} {unit}'
-                case 2: return f'{value:.0f} {unit}'
-                case 3: return f'{value/1000:.1f} k{unit}'
-                case 4: return f'{value/1000:.0f} k{unit}'
-                case 5: return f'{value/1000:.0f} k{unit}'
-                case _: return f'{value:.1f} {unit}'
-        except ValueError:
-            return f'{value} {unit}'
+    try:
+        magnitude = int(math.floor(math.log10(abs(float(value)))))
+        match magnitude:
+            case 0: return f'{value:.0f} {unit}'
+            case 1: return f'{value:.0f} {unit}'
+            case 2: return f'{value:.0f} {unit}'
+            case 3: return f'{value/1000:.1f} k{unit}'
+            case 4: return f'{value/1000:.0f} k{unit}'
+            case 5: return f'{value/1000:.0f} k{unit}'
+            case _: return f'{value:.1f} {unit}'
+    except ValueError:
+        return f'{value} {unit}'
 
 
 class MeasuringData:

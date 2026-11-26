@@ -303,7 +303,7 @@ class Designer:
         else:
             self._draw_arrow((self.display.WIDTH/2, 95), (self.display.WIDTH/2, 124))
 
-        self._draw_labels(data.battery_charge_power, abs(data.power_from_pv), abs(data.power_from_grid), data.charger_active_power)
+        self._draw_labels(abs(data.battery_charge_power), abs(data.power_from_pv), abs(data.power_from_grid), data.charger_active_power)
 
         self._draw_timestamp()
 

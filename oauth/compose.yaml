@@ -1,0 +1,24 @@
+services:
+  helios-oauth:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - ${SOLAREDGE_ENV_FILE:-${HOME}/solaredge-oauth.env}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.helios-oauth.rule=Host(`helios.example.com`)"
+      - "traefik.http.routers.helios-oauth.entrypoints=websecure"
+      - "traefik.http.routers.helios-oauth.tls=true"
+      - "traefik.http.routers.helios-oauth.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.helios-oauth.observability.accesslogs=false"
+      - "traefik.http.routers.helios-oauth.observability.tracing=false"
+      - "traefik.http.routers.helios-oauth.service=helios-oauth"
+      - "traefik.http.services.helios-oauth.loadbalancer.server.port=5000"
+    networks:
+      - helios_net
+
+networks:
+  helios_net:
+    # https://docs.docker.com/compose/networking/#use-a-pre-existing-network
+    name: infrastructure_default
+    external: true

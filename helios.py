@@ -4,24 +4,18 @@ import os
 import time
 import math
 import datetime
-import urllib.parse
+import asyncio
 
 import spidev
 import gpiozero
 from PIL import Image, ImageDraw, ImageFont
 
-import requests
-from pymodbus.client import ModbusTcpClient
-from pymodbus.payload import BinaryPayloadDecoder
-from pymodbus.constants import Endian
+from solaredged import SolarEdge
+from tmodbus import create_async_tcp_client
 
 
 VERBOSE = False
 DISPLAY_REFRESH_TIME = 10 * 60
-
-# TODO: Add API key and site id
-SOLAREDGE_API_KEY = ''
-SOLAREDGE_SITE_ID = ''
 
 # TODO: Add IP and port
 CONVERTER_IP = '192.168.0.100'
@@ -147,13 +141,13 @@ class Display:
         self._send_command(Display.EPD_CMD_POWER_ON)
         self._read_busy()
 
-        if blackimage != None:
+        if blackimage is not None:
             if isinstance(blackimage, Image.Image):
                 blackimage = self._getbuffer(blackimage)
             self._send_command(Display.EPD_CMD_DISPLAY_START_BW)
             self._send_data2(blackimage)
 
-        if ryimage != None:
+        if ryimage is not None:
             if isinstance(ryimage, Image.Image):
                 ryimage = self._getbuffer(ryimage)
             self._send_command(Display.EPD_CMD_DISPLAY_START_R)
@@ -193,6 +187,8 @@ class Designer:
         self.display = display
         self.font = ImageFont.truetype(os.path.join(Designer.RESSOURCE_DIR, Designer.FONT_PATH), 18)
         self.font_small = ImageFont.truetype(os.path.join(Designer.RESSOURCE_DIR, Designer.FONT_PATH), 11)
+        self.image_buffer = None
+        self.draw = None
 
     def _draw_battery(self, state):
         self.draw.rectangle((1+5, 15, 29-5, 20), fill=1, outline=0)
@@ -257,7 +253,8 @@ class Designer:
             self.draw.line(((coord0[0], coord0[1]), (coord1[0], coord1[1])), fill=0, width=3)
 
     def _draw_timestamp(self):
-        self.draw.text((296, 128), f'{datetime.datetime.now().strftime("%d.%m.%y %H:%M")}', font=self.font_small, anchor='rb', fill=0)
+        current_time = datetime.datetime.now().strftime("%d.%m.%y %H:%M")
+        self.draw.text((296, 128), f'{current_time}', font=self.font_small, anchor='rb', fill=0)
 
     def _draw_labels(self, p_bat, p_pv, p_grid, p_car):
         if p_bat: self.draw.text((40, 75), f'{format_measurement(p_bat, "W")}', font=self.font, fill=0)
@@ -273,38 +270,40 @@ class Designer:
         self.draw = ImageDraw.Draw(self.image_buffer)
 
         self._draw_battery(data.battery_charge_level)
-        self._draw_house(data.power_use) # includes data.active_poper from charging station
+        self._draw_house(data.power_usage)
 
         # set car name to be displayed depending on RFID data
-        car_name = WALLBOX_RFID_CARDS.get(data.rfid_card, '')
+        car_name = WALLBOX_RFID_CARDS.get(data.charger_rfid_card, '')
         self._draw_car(car_name)
 
         # switch arrow direction to battery depending on charging status
-        if data.battery_charge_status == 'Discharging':
+        if data.battery_charge_status == 4:
+            # discharging
             self._draw_arrow((35, 64), (90, 64))
-        elif data.battery_charge_status == 'Charging':
+        elif data.battery_charge_status == 3:
+            # charging
             self._draw_arrow((90, 64), (35, 64))
-        elif data.battery_charge_status == 'Idle':
-            # do not draw arrow if battery is neither charging nor discharging
+        elif data.battery_charge_status == 7:
+            # idle, do not draw arrow if battery is neither charging nor discharging
             pass
 
         # draw arrow from PV only when energy is supplied
-        if data.power_from_pv:
+        if data.power_from_pv > 0:
             self._draw_arrow((self.display.WIDTH/2, 4), (self.display.WIDTH/2, 35))
+        else:
+            self._draw_arrow((self.display.WIDTH/2, 35), (self.display.WIDTH/2, 4))
 
         # draw arrow to charging station only when car is charging
-        if data.charging_status == 3:
+        if data.charger_charging_status == 3:
             self._draw_arrow((205, 64), (245, 64))
 
         # check whether grid is supplying power or energy is fed back into the grid
-        if data.power_from_grid - data.power_feed_in > 0:
+        if data.power_from_grid > 0:
             self._draw_arrow((self.display.WIDTH/2, 124), (self.display.WIDTH/2, 95))
-            grid_power_flow = data.power_from_grid - data.power_feed_in
         else:
             self._draw_arrow((self.display.WIDTH/2, 95), (self.display.WIDTH/2, 124))
-            grid_power_flow = data.power_feed_in - data.power_from_grid
 
-        self._draw_labels(data.battery_charge_power, data.power_from_pv, grid_power_flow, data.active_power)
+        self._draw_labels(abs(data.battery_charge_power), abs(data.power_from_pv), abs(data.power_from_grid), data.charger_active_power)
 
         self._draw_timestamp()
 
@@ -314,161 +313,79 @@ class Designer:
         self.display.display(self.image_buffer, None)
 
 
-class ModbusConnection:
-    """
-    Context manager for Modbus connection
-
-    Stolen from: https://gist.github.com/wcheek/35599f2db14592129c358f3b35988d16
-    """
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
-        self.client = None
-
-    def __enter__(self):
-        self.client = ModbusTcpClient(host=self.host, port=self.port)
-        self.client.connect()
-        return self.client
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.client:
-            self.client.close()
-        return False
-
-
 class HeliosException(Exception):
     """Custom exception for Helios Power Gauge."""
 
 
-def read_data_from_charging_station_via_modbus():
+def convert_registers_to_uint32(registers):
+    """Convert two 16-bit registers to a 32-bit unsigned integer."""
+    if len(registers) < 2:
+        raise HeliosException('Unexpected Modbus register value: insufficient registers')
+    return (registers[0] << 16) | registers[1]
+
+
+def convert_registers_to_int32(registers):
+    """Convert two 16-bit registers to a 32-bit signed integer."""
+    if len(registers) < 2:
+        raise HeliosException('Unexpected Modbus register value: insufficient registers')
+    value = (registers[0] << 16) | registers[1]
+    if value >= 0x80000000:
+        value -= 0x100000000
+    return value
+
+
+async def read_data_from_charging_station_via_modbus():
     """
     Read all necessary data points from the wallbox by ModbusTCP.
 
     References:
      - Modbus addresses for wallbox:
-       https://www.keba.com/download/x/dea7ae6b84/kecontactp30modbustcp_pgen.pdf
+       https://a.storyblok.com/f/40131/x/44932c2bc8/kecontactp30modbustcp_pgen.pdf
     """
-    with ModbusConnection(host=WALLBOX_IP, port=WALLBOX_PORT) as client:
+    async with create_async_tcp_client(WALLBOX_IP, WALLBOX_PORT, unit_id=1) as client:
         # read charging status
-        result = client.read_holding_registers(address=1000, count=1)
-        charging_status = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint()
+        result = await client.read_holding_registers(1000, 2)
+        charging_status = convert_registers_to_uint32(result)
         # read total energy (register contains the total energy consumption in 0.1 watt-hours)
-        result = client.read_holding_registers(address=1036, count=1)
-        total_energy = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint() / 10000
+        result = await client.read_holding_registers(1036, 2)
+        total_energy = convert_registers_to_uint32(result) / 10000
         # read active power (register contains the active power in milliwatts)
-        result = client.read_holding_registers(address=1020, count=1)
-        active_power = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint() / 1000
+        result = await client.read_holding_registers(1020, 2)
+        active_power = convert_registers_to_uint32(result) / 1000
         # read RFID card number
-        result = client.read_holding_registers(address=1500, count=1)
-        rfid_card = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.Big).decode_32bit_uint()
+        result = await client.read_holding_registers(1500, 2)
+        rfid_card = convert_registers_to_uint32(result)
         # read charged energy (register contains the transferred energy of the current session in 0.1 watt-hours)
-        #result = client.read_holding_registers(address=1502, count=1)
-        #charged_energy = BinaryPayloadDecoder.fromRegisters(result.registers, byteorder=Endian.BIG).decode_32bit_uint() / 10000
-        #print(f'Charged energy in current session: {charged_energy} kWh')
-    return charging_status, total_energy, active_power, rfid_card
+        result = await client.read_holding_registers(1502, 2)
+        charged_energy_for_session = convert_registers_to_uint32(result) / 10000
+    return charging_status, total_energy, active_power, rfid_card, charged_energy_for_session
 
 
-def read_data_from_converter_via_modbus():
+async def read_data_from_converter_via_modbus():
     """
     Read all necessary data points from the converter by ModbusTCP.
 
     References:
      - Modbus addresses for inverter:
        https://knowledge-center.solaredge.com/sites/kc/files/sunspec-implementation-technical-note.pdf
-     - Decoding of values with BinaryPayloadDecoder:
-       https://pymodbus.readthedocs.io/en/latest/source/library/pymodbus.html#pymodbus.payload.BinaryPayloadDecoder
+     - tmodbus:
+       https://github.com/wlcrs/tmodbus
     """
-    with ModbusConnection(host=CONVERTER_IP, port=CONVERTER_PORT) as client:
-        # read current AC power from converter
-        result = client.read_holding_registers(address=40083, count=2)
-        ac_power_used_value = BinaryPayloadDecoder.fromRegisters([result.registers[0]], byteorder=Endian.Big).decode_16bit_int()
-        ac_power_used_scale_factor = BinaryPayloadDecoder.fromRegisters([result.registers[1]], byteorder=Endian.Big).decode_16bit_int()
-        power_use = ac_power_used_value * pow(10, ac_power_used_scale_factor)
-    battery_charge_level = 0
-    battery_charge_status = 'Unknown'
-    battery_charge_power = 0
-    power_from_grid = 0
-    power_from_pv = 0
-    power_self_consumption = 0
-    power_feed_in = 0
-    return battery_charge_level, battery_charge_status, battery_charge_power, power_use, power_from_grid, power_from_pv, power_self_consumption, power_feed_in
-
-
-def read_power_flow_data_from_api(api_key, site_id):
-    """Reads all power flow values from the SolarEdge API."""
-    url = f'https://monitoringapi.solaredge.com/site/{site_id}/currentPowerFlow?api_key={api_key}'
-    response = requests.get(url, timeout=5)
-    if response.status_code != 200:
-        print(f'Error: {response}')
-        raise HeliosException('Error reading data from SolarEdge API')
-    data = response.json()['siteCurrentPowerFlow']
-    scaling_factor = 1000 if data['unit'] == 'kW' else 1
-    battery_charge_level = data['STORAGE']['chargeLevel']
-    battery_charge_status = data['STORAGE']['status']
-    battery_charge_power = float(data['STORAGE']['currentPower']) * scaling_factor
-    return battery_charge_level, battery_charge_status, battery_charge_power
-
-
-def read_power_details_data_from_api(api_key, site_id):
-    """
-    Reads all power values as median over the last 15 minutes from the
-    SolarEdge API.
-    """
-    # build URL for API request
-    now = datetime.datetime.now()
-    fifteen_minutes_ago = now - datetime.timedelta(minutes=15)
-    start_time = fifteen_minutes_ago.strftime('%Y-%m-%d %H:%M:%S')
-    end_time = now.strftime('%Y-%m-%d %H:%M:%S')
-    start_time_url = urllib.parse.quote(start_time, safe='/', encoding=None, errors=None)
-    end_time_url = urllib.parse.quote(end_time, safe='/', encoding=None, errors=None)
-    url = f'https://monitoringapi.solaredge.com/site/{site_id}/powerDetails?startTime={start_time_url}&endTime={end_time_url}&api_key={api_key}'
-    response = requests.get(url, timeout=5)
-    if response.status_code != 200:
-        print(f'Error: {response}')
-        raise HeliosException('Error reading data from SolarEdge API')
-    # extract power values from response
-    data = response.json()
-    scaling_factor = 1000 if data['powerDetails']['unit'] == 'kW' else 1
-    power_production_15m = 0
-    power_consumption_15m = 0
-    power_purchased_15m = 0
-    power_self_consumption_15m = 0
-    power_feed_in_15m = 0
-    for meter in data['powerDetails']['meters']:
-        try:
-            # check if last measurement contains no actual value...
-            if 'value' not in meter['values'][-1]:
-                # ...and delete last element if that's true
-                del meter['values'][-1]
-            if meter['type'] == 'Production':
-                power_production_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'Consumption':
-                power_consumption_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'SelfConsumption':
-                power_self_consumption_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'FeedIn':
-                power_feed_in_15m = float(meter['values'][-1]['value']) * scaling_factor
-            elif meter['type'] == 'Purchased':
-                power_purchased_15m = float(meter['values'][-1]['value']) * scaling_factor
-        except KeyError:
-            pass
-    return power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m
-
-
-def read_data_from_converter_via_api():
-    """
-    Read all necessary data points from the SolarEdge API.
-
-    Important: The SolarEdge API is rate-limited to 300 requests per day.
-
-    References:
-     - API documentation:
-       https://www.solaredge.com/sites/default/files/se_monitoring_api.pdf
-       https://developers.solaredge.com/docs/monitoring/e9nwvc91l1jf5-getting-started-with-monitoring-api
-    """
-    battery_charge_level, battery_charge_status, battery_charge_power = read_power_flow_data_from_api(SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID)
-    power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m = read_power_details_data_from_api(SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID)
-    return battery_charge_level, battery_charge_status, battery_charge_power, power_consumption_15m, power_purchased_15m, power_production_15m, power_self_consumption_15m, power_feed_in_15m
+    async with create_async_tcp_client(CONVERTER_IP, CONVERTER_PORT, unit_id=1) as client:
+        # detect the layout of the inverter
+        solaredge = await SolarEdge.async_probe(client)
+        await solaredge.async_update()  # one read per sub-system
+        inverter = solaredge.inverter
+        power_from_pv = inverter.ac_power
+        if VERBOSE:
+            print(f"{solaredge.common.manufacturer} {solaredge.common.model}: {inverter.status.name}")
+        battery = solaredge.batteries[0]
+        battery_charge_level = battery.state_of_energy if battery.state_of_energy is not None else 0
+        battery_charge_status = battery.status if battery.status else 0
+        battery_charge_power = battery.dc_power if battery.dc_power is not None else 0
+        meter = solaredge.meters[0]
+        power_from_grid = -meter.ac_power
+    return battery_charge_level, battery_charge_status, battery_charge_power, power_from_grid, power_from_pv+battery_charge_power
 
 
 def format_measurement(value, unit):
@@ -478,32 +395,44 @@ def format_measurement(value, unit):
     """
     if not value:
         return f'0 {unit}'
-    elif unit == 'kWh':
+    if unit == 'kWh':
         return f'{value:.0f} {unit}'
-    elif unit == '%':
+    if unit == '%':
         return f'{value:.0f} {unit}'
-    else:
-        try:
-            magnitude = int(math.floor(math.log10(abs(float(value)))))
-            match magnitude:
-                case 0: return f'{value:.0f} {unit}'
-                case 1: return f'{value:.0f} {unit}'
-                case 2: return f'{value:.0f} {unit}'
-                case 3: return f'{value/1000:.1f} k{unit}'
-                case 4: return f'{value/1000:.0f} k{unit}'
-                case 5: return f'{value/1000:.0f} k{unit}'
-                case _: return f'{value:.1f} {unit}'
-        except ValueError:
-            return f'{value} {unit}'
+    try:
+        magnitude = int(math.floor(math.log10(abs(float(value)))))
+        match magnitude:
+            case 0: return f'{value:.0f} {unit}'
+            case 1: return f'{value:.0f} {unit}'
+            case 2: return f'{value:.0f} {unit}'
+            case 3: return f'{value/1000:.1f} k{unit}'
+            case 4: return f'{value/1000:.0f} k{unit}'
+            case 5: return f'{value/1000:.0f} k{unit}'
+            case _: return f'{value:.1f} {unit}'
+    except ValueError:
+        return f'{value} {unit}'
 
 
 class MeasuringData:
-    def __init__(self, prefer_modbus=False):
-        if prefer_modbus:
-            self.battery_charge_level, self.battery_charge_status, self.battery_charge_power, self.power_use, self.power_from_grid, self.power_from_pv, self.power_self_consumption, self.power_feed_in = read_data_from_converter_via_modbus()
-        else:
-            self.battery_charge_level, self.battery_charge_status, self.battery_charge_power, self.power_use, self.power_from_grid, self.power_from_pv, self.power_self_consumption, self.power_feed_in = read_data_from_converter_via_api()
-        self.charging_status, self.total_energy, self.active_power, self.rfid_card = read_data_from_charging_station_via_modbus()
+    def __init__(self):
+        self.battery_charge_level = 0
+        self.battery_charge_status = 'Unknown'
+        self.battery_charge_power = 0
+        self.power_from_grid = 0
+        self.power_from_pv = 0
+        self.power_usage = 0
+        self.charger_charging_status = 0
+        self.charger_total_energy = 0
+        self.charger_active_power = 0
+        self.charger_rfid_card = 0
+        self.charger_energy_for_session = 0
+
+    async def load_data(self):
+        """Asynchronously load data from Modbus."""
+        self.battery_charge_level, self.battery_charge_status, self.battery_charge_power, self.power_from_grid, self.power_from_pv = await read_data_from_converter_via_modbus()
+        self.charger_charging_status, self.charger_total_energy, self.charger_active_power, self.charger_rfid_card, self.charger_energy_for_session = await read_data_from_charging_station_via_modbus()
+        # calculate power usage of house without charger depending on inputs (PV and grid) and outputs (battery and charger)
+        self.power_usage = self.power_from_grid + self.power_from_pv - self.battery_charge_power - self.charger_active_power
 
     def __str__(self):
         charging_status_values = {
@@ -515,25 +444,43 @@ class MeasuringData:
             5: 'The charging process is temporarily interrupted because the temperature is too high or the wallbox is in suspended mode.',
         }
 
+        # battery charge status values
+        # source: https://github.com/frenck/python-solaredged/blob/dc6c0241d34ad93f118f3a443a26483fd283131a/src/solaredged/const.py#L107
+        battery_charge_status_values = {
+            0: 'Off',
+            1: 'Standby',
+            2: 'Init',
+            3: 'Charge',
+            4: 'Discharge',
+            5: 'Fault',
+            6: 'Preserve Charge',
+            7: 'Idle',
+            10: 'Power Saving'
+        }
+
         ret = ''
-        ret += f'Battery charge level: {self.battery_charge_level} %\n'
-        ret += f'Battery charge status: {self.battery_charge_status}\n'
-        ret += f'Battery charge power: {self.battery_charge_power} W\n'
-        ret += f'Power use including EV charging station: {self.power_use} W\n'
+        ret += f'Battery -> charge level: {self.battery_charge_level} %\n'
+        ret += f'Battery -> charge status: {battery_charge_status_values[self.battery_charge_status]}\n'
+        ret += f'Battery -> charge power: {self.battery_charge_power} W\n'
         ret += f'Power from grid: {self.power_from_grid} W\n'
         ret += f'Power from PV: {self.power_from_pv} W\n'
-        ret += f'Power feed in: {self.power_feed_in} W\n'
-        ret += f'Power self consumption: {self.power_self_consumption} W\n'
-        ret += f'Charging status: {charging_status_values[self.charging_status]}\n'
-        ret += f'Total energy: {self.total_energy} kWh\n'
-        ret += f'Active power: {self.active_power} W\n'
-        ret += f'RFID card: {self.rfid_card:0x}\n'
+        ret += f'Power usage (without charger): {self.power_usage} W\n'
+        ret += f'Charger -> charging status: {charging_status_values[self.charger_charging_status]}\n'
+        ret += f'Charger -> total energy: {self.charger_total_energy} kWh\n'
+        ret += f'Charger -> active power: {self.charger_active_power} W\n'
+        ret += f'Charger -> RFID card: {self.charger_rfid_card:0x}\n'
+        ret += f'Charger -> energy for current session: {self.charger_energy_for_session} kWh\n'
         return ret
 
 
 if __name__ == '__main__':
-    with Display() as display:
-        designer = Designer(display)
-        while True:
-            designer.draw_data(MeasuringData())
-            time.sleep(DISPLAY_REFRESH_TIME)
+    async def main():
+        data = MeasuringData()
+        with Display() as display:
+            designer = Designer(display)
+            while True:
+                await data.load_data()
+                designer.draw_data(data)
+                await asyncio.sleep(DISPLAY_REFRESH_TIME)
+
+    asyncio.run(main())
